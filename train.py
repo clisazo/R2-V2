@@ -788,8 +788,10 @@ def main() -> None:
                         tqdm.write(
                             f'  [{cn}]  '
                             f'frac_pos={(probs[:, ci] > 0.5).float().mean():.4f}  '
-                            f'gt_sum={gt_p[:, ci].sum():.0f}'
+                            f'gt_sum={gt_p[:, ci].sum():.0f}  '
+                            f'dice={d[cn]:.4f}'
                         )
+                    tqdm.write(f'  mean dice={d["mean"]:.4f}')
 
             running_loss   += loss.item()
             epoch_loss_sum += loss.item()
