@@ -7,7 +7,7 @@ mirroring the GAVE2 reference format:
     <OUTPUT_ROOT>/
         GAVE2/
             training/
-                av/        (R=artery, G=common, B=vein, 3-channel PNG)
+                av/        (R=artery, G=all-vessels, B=vein, 3-channel PNG)
                 images/    (CFP images, PNG)
                 masks/     (FOV mask, PNG)
                 masks_OD/  (optic disc mask, PNG)   ← GAVE2 only
@@ -37,8 +37,13 @@ mirroring the GAVE2 reference format:
 Conventions
 -----------
 * All outputs are 3-channel PNG (RGB).
-* AV masks  →  R=artery, G=common(A∩V), B=vein  (values 0 or 255).
-* Binary masks (no A/V split) → all three channels equal; white=vessel.
+* AV masks  →  R=artery (incl. crossings), G=all-vessels (BV),
+               B=vein (incl. crossings)  (values 0 or 255).
+  This matches what train.py expects for `gave_label_fmt`
+  (R=A, G=BV, B=V).  Crossing pixels belong to BOTH the artery and the
+  vein tree, so they are set in R and B; the BV channel is the union.
+* Binary masks (no A/V split) → R=0, B=0, G=vessel (BV only).  Empty R/B
+  is the signal train.py's detect_bv_only() uses to skip A/V supervision.
 * FOV / OD masks → single logical plane stored in all three channels.
 * Source files are never modified.
 """
@@ -105,25 +110,37 @@ def build_av_from_artery_vein(
     vein: np.ndarray,
 ) -> np.ndarray:
     """
-    Combine separate binary artery and vein masks into a 3-channel AV mask.
-    R = artery, G = artery ∩ vein (common), B = vein.
+    Combine separate binary artery and vein masks into a 3-channel AV mask
+    in the unified convention:  R = artery, G = all-vessels (A∪V), B = vein.
+    Crossing pixels (A∩V) are present in both the artery and vein source
+    masks, so they naturally end up in both R and B.
     All inputs and outputs are 0/255.
     """
-    a = binarize(artery)
-    v = binarize(vein)
-    common = binarize((a.astype(np.uint16) + v.astype(np.uint16)) > 255)
-    return np.stack([a, common, v], axis=-1).astype(np.uint8)
+    a  = binarize(artery)
+    v  = binarize(vein)
+    bv = np.clip(a.astype(np.uint16) + v.astype(np.uint16), 0, 255).astype(np.uint8)
+    return np.stack([a, bv, v], axis=-1).astype(np.uint8)
 
 
 def extract_gave2_av(src: np.ndarray) -> np.ndarray:
     """
-    GAVE2 / Fundus-AVSeg AV masks come as RGBA or RGB where
-    R=arteries, G=common, B=veins.  Strip alpha if present, keep 3 ch.
+    GAVE2 / Fundus-AVSeg / LES-AV AV masks come as RGBA or RGB where
+    R=arteries, G=common(A∩V crossing), B=veins.  Remap to the unified
+    convention  R=artery(incl. crossings), G=all-vessels, B=vein(incl.
+    crossings).
     """
     if src.ndim == 2:
         # Unexpected grayscale – replicate
         return gray_to_rgb(src)
-    return src[:, :, :3].astype(np.uint8)
+    rgb   = src[:, :, :3]
+    a_src = binarize(rgb[:, :, 0])   # pure artery
+    cross = binarize(rgb[:, :, 1])   # common / crossing (A∩V)
+    v_src = binarize(rgb[:, :, 2])   # pure vein
+
+    artery = np.clip(a_src.astype(np.uint16) + cross, 0, 255).astype(np.uint8)
+    vein   = np.clip(v_src.astype(np.uint16) + cross, 0, 255).astype(np.uint8)
+    bv     = np.clip(a_src.astype(np.uint16) + cross + v_src, 0, 255).astype(np.uint8)
+    return np.stack([artery, bv, vein], axis=-1).astype(np.uint8)
 
 
 # ───────────────────────────── GAVE2 ────────────────────────────────────────
@@ -241,9 +258,10 @@ def process_hrf() -> None:
             raw = np.array(Image.open(f))
 
             if description.startswith("av3"):
-                # Single-channel binary → replicate to 3 ch
-                gray = binarize(raw if raw.ndim == 2 else raw[:, :, 0])
-                arr  = gray_to_rgb(gray)
+                # Vessel-only mask (no A/V split) → BV channel (G); R/B empty
+                gray  = binarize(raw if raw.ndim == 2 else raw[:, :, 0])
+                zeros = np.zeros_like(gray)
+                arr   = np.stack([zeros, gray, zeros], axis=-1)
             else:
                 if raw.ndim == 2:
                     arr = gray_to_rgb(raw)
@@ -285,10 +303,11 @@ def process_rite() -> None:
             raw = np.array(Image.open(f))
 
             if is_av:
-                # 3 equal channels → take first, binarize, replicate
-                ch = raw[:, :, 0] if raw.ndim == 3 else raw
-                gray = binarize(ch)
-                arr  = gray_to_rgb(gray)
+                # Vessel-only mask (no A/V split) → BV channel (G); R/B empty
+                ch    = raw[:, :, 0] if raw.ndim == 3 else raw
+                gray  = binarize(ch)
+                zeros = np.zeros_like(gray)
+                arr   = np.stack([zeros, gray, zeros], axis=-1)
             else:
                 if raw.ndim == 2:
                     arr = gray_to_rgb(raw)
