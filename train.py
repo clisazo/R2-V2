@@ -775,6 +775,15 @@ def main() -> None:
 
             with torch.no_grad():
                 d = dice_score(predictions[-1], gt_p, mask_p)
+                if iteration == 1:
+                    probs = torch.sigmoid(predictions[-1])
+                    tqdm.write(
+                        f'[DEBUG iter 1]  '
+                        f'logits [{predictions[-1].min():.2f}, {predictions[-1].max():.2f}]  '
+                        f'frac_pred_pos={( probs > 0.5).float().mean():.4f}  '
+                        f'gt_bv_sum={gt_p[:, 2].sum():.0f}  '
+                        f'mask_sum={mask_p.sum():.0f}'
+                    )
 
             running_loss   += loss.item()
             epoch_loss_sum += loss.item()
