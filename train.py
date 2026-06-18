@@ -748,14 +748,20 @@ def main() -> None:
             num_workers=2, pin_memory=True, worker_init_fn=worker_init_fn,
         )
 
-        for inp, gt, mask, bv_only in loader:
+        epoch_loss_sum = 0.0
+        epoch_dice     = {'a': 0.0, 'v': 0.0, 'bv': 0.0}
+        epoch_steps    = 0
+
+        pbar = tqdm(loader, desc=f'Epoch {epoch:4d}', leave=True,
+                    unit='img', dynamic_ncols=True)
+        for inp, gt, mask, bv_only in pbar:
             if iteration >= args.max_iterations:
                 break
 
             inp     = inp.to(device)
             gt      = gt.to(device)
             mask    = mask.to(device)
-            bv_only = bv_only.to(device)   # [B]
+            bv_only = bv_only.to(device)
 
             inp_p,  _ = pad_batch(inp)
             gt_p,   _ = pad_batch(gt)
@@ -767,13 +773,28 @@ def main() -> None:
             loss.backward()
             optimizer.step()
 
-            running_loss += loss.item()
-            iteration    += 1
+            with torch.no_grad():
+                d = dice_score(predictions[-1], gt_p, mask_p)
+
+            running_loss   += loss.item()
+            epoch_loss_sum += loss.item()
+            epoch_steps    += 1
+            for k in ('a', 'v', 'bv'):
+                epoch_dice[k] += d[k]
+
+            iteration += 1
+
+            pbar.set_postfix(
+                loss=f'{loss.item():.4f}',
+                dice=f'{d["mean"]:.3f}',
+                it=iteration,
+                refresh=False,
+            )
 
             if iteration % args.log_every == 0:
                 avg  = running_loss / args.log_every
                 secs = (time.time() - t0) / args.log_every
-                print(
+                tqdm.write(
                     f'[{iteration:>7d}/{args.max_iterations}]  '
                     f'loss={avg:.4f}  epoch={epoch}  {secs:.2f}s/it'
                 )
@@ -785,12 +806,29 @@ def main() -> None:
                 ckpt_fn = save_dir / f'{args.model_type}_{iteration:07d}.pth'
                 torch.save(model.state_dict(), ckpt_fn)
                 torch.save(model.state_dict(), save_dir / f'{args.model_type}_latest.pth')
-                print(f'  → checkpoint saved: {ckpt_fn.name}')
+                tqdm.write(f'  → checkpoint saved: {ckpt_fn.name}')
+
+        # ── End-of-epoch train summary ───────────────────────────────────────
+        if epoch_steps > 0:
+            mean_train_loss = epoch_loss_sum / epoch_steps
+            mean_train_dice = {k: epoch_dice[k] / epoch_steps for k in ('a', 'v', 'bv')}
+            writer.add_scalar('Dice/train/a',  mean_train_dice['a'],  iteration)
+            writer.add_scalar('Dice/train/v',  mean_train_dice['v'],  iteration)
+            writer.add_scalar('Dice/train/bv', mean_train_dice['bv'], iteration)
+            pbar.set_description(
+                f'Epoch {epoch:4d} | '
+                f'loss={mean_train_loss:.4f}  '
+                f'a={mean_train_dice["a"]:.3f}  '
+                f'v={mean_train_dice["v"]:.3f}  '
+                f'bv={mean_train_dice["bv"]:.3f}'
+            )
 
         # ── End-of-epoch validation ──────────────────────────────────────────
         if val_ds is not None:
             model.eval()
-            val_loss = 0.0
+            val_loss  = 0.0
+            val_dice  = {'a': 0.0, 'v': 0.0, 'bv': 0.0}
+            val_steps = 0
             with torch.no_grad():
                 for v_inp, v_gt, v_mask, v_bv_only in DataLoader(
                     val_ds, batch_size=1, worker_init_fn=worker_init_fn
@@ -804,15 +842,29 @@ def main() -> None:
                     v_mask_p, _ = pad_batch(v_mask)
                     v_preds     = model(v_inp_p)
                     val_loss   += criterion(v_preds, v_gt_p, v_mask_p, v_bv_only).item()
-            val_loss /= len(val_ds)
-            writer.add_scalar('Loss/val', val_loss, iteration)
-            print(f'  → [epoch {epoch}] val loss={val_loss:.4f}', end='')
+                    d_val       = dice_score(v_preds[-1], v_gt_p, v_mask_p)
+                    for k in ('a', 'v', 'bv'):
+                        val_dice[k] += d_val[k]
+                    val_steps += 1
+            n = max(val_steps, 1)
+            val_loss      /= n
+            mean_val_dice  = {k: val_dice[k] / n for k in ('a', 'v', 'bv')}
+            writer.add_scalar('Loss/val',    val_loss,            iteration)
+            writer.add_scalar('Dice/val/a',  mean_val_dice['a'],  iteration)
+            writer.add_scalar('Dice/val/v',  mean_val_dice['v'],  iteration)
+            writer.add_scalar('Dice/val/bv', mean_val_dice['bv'], iteration)
+            msg = (
+                f'  → val  loss={val_loss:.4f}  '
+                f'a={mean_val_dice["a"]:.3f}  '
+                f'v={mean_val_dice["v"]:.3f}  '
+                f'bv={mean_val_dice["bv"]:.3f}'
+            )
             if val_loss < best_val_loss:
-                best_val_loss  = val_loss
-                best_ckpt_fn   = save_dir / f'{args.model_type}_best_val.pth'
+                best_val_loss = val_loss
+                best_ckpt_fn  = save_dir / f'{args.model_type}_best_val.pth'
                 torch.save(model.state_dict(), best_ckpt_fn)
-                print(f'  ✓ new best — saved {best_ckpt_fn.name}', end='')
-            print()
+                msg += f'  ✓ new best — saved {best_ckpt_fn.name}'
+            tqdm.write(msg)
             model.train()
 
     # ── Final save ────────────────────────────────────────────────────────────
