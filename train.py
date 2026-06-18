@@ -33,6 +33,8 @@ import time
 from pathlib import Path
 from typing import Optional
 
+from torch.utils.tensorboard import SummaryWriter
+
 import numpy as np
 import torch
 import torch.nn as nn
@@ -726,11 +728,17 @@ def main() -> None:
         json.dump(config, f, indent=4)
     print(f'Config saved to {config_fn}')
 
+    # ── TensorBoard writer ───────────────────────────────────────────────────
+    log_dir = save_dir / 'logs'
+    writer  = SummaryWriter(log_dir=str(log_dir))
+    print(f'TensorBoard logs: {log_dir}')
+
     # ── Training loop ─────────────────────────────────────────────────────────
-    iteration    = 0
-    epoch        = 0
-    running_loss = 0.0
-    t0           = time.time()
+    iteration      = 0
+    epoch          = 0
+    running_loss   = 0.0
+    best_val_loss  = float('inf')
+    t0             = time.time()
     model.train()
 
     while iteration < args.max_iterations:
@@ -769,6 +777,7 @@ def main() -> None:
                     f'[{iteration:>7d}/{args.max_iterations}]  '
                     f'loss={avg:.4f}  epoch={epoch}  {secs:.2f}s/it'
                 )
+                writer.add_scalar('Loss/train', avg, iteration)
                 running_loss = 0.0
                 t0           = time.time()
 
@@ -778,24 +787,36 @@ def main() -> None:
                 torch.save(model.state_dict(), save_dir / f'{args.model_type}_latest.pth')
                 print(f'  → checkpoint saved: {ckpt_fn.name}')
 
-                if val_ds is not None:
-                    model.eval()
-                    val_loss = 0.0
-                    with torch.no_grad():
-                        for v_inp, v_gt, v_mask, v_bv_only in DataLoader(val_ds, batch_size=1, worker_init_fn=worker_init_fn):
-                            v_inp     = v_inp.to(device)
-                            v_gt      = v_gt.to(device)
-                            v_mask    = v_mask.to(device)
-                            v_bv_only = v_bv_only.to(device)
-                            v_inp_p,  _ = pad_batch(v_inp)
-                            v_gt_p,   _ = pad_batch(v_gt)
-                            v_mask_p, _ = pad_batch(v_mask)
-                            v_preds     = model(v_inp_p)
-                            val_loss   += criterion(v_preds, v_gt_p, v_mask_p, v_bv_only).item()
-                    print(f'  → val loss={val_loss / len(val_ds):.4f}')
-                    model.train()
+        # ── End-of-epoch validation ──────────────────────────────────────────
+        if val_ds is not None:
+            model.eval()
+            val_loss = 0.0
+            with torch.no_grad():
+                for v_inp, v_gt, v_mask, v_bv_only in DataLoader(
+                    val_ds, batch_size=1, worker_init_fn=worker_init_fn
+                ):
+                    v_inp     = v_inp.to(device)
+                    v_gt      = v_gt.to(device)
+                    v_mask    = v_mask.to(device)
+                    v_bv_only = v_bv_only.to(device)
+                    v_inp_p,  _ = pad_batch(v_inp)
+                    v_gt_p,   _ = pad_batch(v_gt)
+                    v_mask_p, _ = pad_batch(v_mask)
+                    v_preds     = model(v_inp_p)
+                    val_loss   += criterion(v_preds, v_gt_p, v_mask_p, v_bv_only).item()
+            val_loss /= len(val_ds)
+            writer.add_scalar('Loss/val', val_loss, iteration)
+            print(f'  → [epoch {epoch}] val loss={val_loss:.4f}', end='')
+            if val_loss < best_val_loss:
+                best_val_loss  = val_loss
+                best_ckpt_fn   = save_dir / f'{args.model_type}_best_val.pth'
+                torch.save(model.state_dict(), best_ckpt_fn)
+                print(f'  ✓ new best — saved {best_ckpt_fn.name}', end='')
+            print()
+            model.train()
 
     # ── Final save ────────────────────────────────────────────────────────────
+    writer.close()
     final_fn = save_dir / f'{args.model_type}.pth'
     torch.save(model.state_dict(), final_fn)
     print(f'\nTraining complete. Final model: {final_fn}')
