@@ -3,6 +3,7 @@ import argparse
 from argparse import Namespace
 import json
 import gc
+import random
 from dataclasses import dataclass
 
 import numpy as np
@@ -40,6 +41,21 @@ class ResizedImage:
 
 ########################################################################
 # Functions
+
+
+def set_seed(seed: int) -> None:
+    """Set seed for reproducibility across all random number generators.
+    
+    Args:
+        seed: Random seed value
+    """
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
 
 
 def get_args() -> Namespace:
@@ -91,6 +107,11 @@ def get_args() -> Namespace:
         '--tta',
         action='store_true', default=False,
         help='Use test time augmentation [default: %(default)s]'
+    )
+    parser.add_argument(
+        '--seed',
+        type=int, default=77,
+        help='Random seed for reproducibility [default: %(default)s]'
     )
     return parser.parse_args()
 
@@ -266,6 +287,7 @@ def get_corr_fn(ref_fn: Path, path: Path | None) -> Path | None:
 
 def main():
     args = get_args()
+    set_seed(args.seed)
     use_cfp = args.model_type == 'bv'
     test_aug = args.tta
 
