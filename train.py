@@ -748,9 +748,11 @@ def main() -> None:
             num_workers=2, pin_memory=True, worker_init_fn=worker_init_fn,
         )
 
-        epoch_loss_sum = 0.0
-        epoch_dice     = {'a': 0.0, 'v': 0.0, 'bv': 0.0}
-        epoch_steps    = 0
+        epoch_loss_sum  = 0.0
+        epoch_steps     = 0
+        epoch_dice_bv   = 0.0
+        epoch_dice_av   = {'a': 0.0, 'v': 0.0}
+        epoch_steps_av  = 0
 
         pbar = tqdm(loader, desc=f'Epoch {epoch:4d}', leave=True,
                     unit='img', dynamic_ncols=True)
@@ -775,38 +777,26 @@ def main() -> None:
 
             with torch.no_grad():
                 d = dice_score(predictions[-1], gt_p, mask_p)
-                if iteration == 1:
-                    probs = torch.sigmoid(predictions[-1])
-                    tqdm.write(
-                        f'[DEBUG iter 1]  '
-                        f'logits [{predictions[-1].min():.2f}, {predictions[-1].max():.2f}]  '
-                        f'frac_pred_pos={( probs > 0.5).float().mean():.4f}  '
-                        f'gt_bv_sum={gt_p[:, 2].sum():.0f}  '
-                        f'mask_sum={mask_p.sum():.0f}'
-                    )
-                    for ci, cn in enumerate(['a', 'v', 'bv']):
-                        tqdm.write(
-                            f'  [{cn}]  '
-                            f'frac_pos={(probs[:, ci] > 0.5).float().mean():.4f}  '
-                            f'gt_sum={gt_p[:, ci].sum():.0f}  '
-                            f'dice={d[cn]:.4f}'
-                        )
-                    tqdm.write(f'  mean dice={d["mean"]:.4f}')
 
+            is_bv_only = bv_only.item() == 1.0
             running_loss   += loss.item()
             epoch_loss_sum += loss.item()
             epoch_steps    += 1
-            for k in ('a', 'v', 'bv'):
-                epoch_dice[k] += d[k]
+            epoch_dice_bv  += d['bv']
+            if not is_bv_only:
+                epoch_dice_av['a'] += d['a']
+                epoch_dice_av['v'] += d['v']
+                epoch_steps_av     += 1
 
             iteration += 1
 
-            pbar.set_postfix(
-                loss=f'{loss.item():.4f}',
-                dice=f'{d["mean"]:.3f}',
-                it=iteration,
-                refresh=False,
-            )
+            if is_bv_only:
+                pbar.set_postfix(loss=f'{loss.item():.4f}', bv=f'{d["bv"]:.3f}',
+                                 refresh=False)
+            else:
+                pbar.set_postfix(loss=f'{loss.item():.4f}', a=f'{d["a"]:.3f}',
+                                 v=f'{d["v"]:.3f}', bv=f'{d["bv"]:.3f}',
+                                 refresh=False)
 
             if iteration % args.log_every == 0:
                 avg  = running_loss / args.log_every
@@ -828,24 +818,30 @@ def main() -> None:
         # ── End-of-epoch train summary ───────────────────────────────────────
         if epoch_steps > 0:
             mean_train_loss = epoch_loss_sum / epoch_steps
-            mean_train_dice = {k: epoch_dice[k] / epoch_steps for k in ('a', 'v', 'bv')}
-            writer.add_scalar('Dice/train/a',  mean_train_dice['a'],  iteration)
-            writer.add_scalar('Dice/train/v',  mean_train_dice['v'],  iteration)
-            writer.add_scalar('Dice/train/bv', mean_train_dice['bv'], iteration)
+            mean_dice_bv    = epoch_dice_bv / epoch_steps
+            mean_dice_av    = (
+                {k: epoch_dice_av[k] / epoch_steps_av for k in ('a', 'v')}
+                if epoch_steps_av > 0 else {'a': 0.0, 'v': 0.0}
+            )
+            writer.add_scalar('Dice/train/a',  mean_dice_av['a'], iteration)
+            writer.add_scalar('Dice/train/v',  mean_dice_av['v'], iteration)
+            writer.add_scalar('Dice/train/bv', mean_dice_bv,      iteration)
             pbar.set_description(
                 f'Epoch {epoch:4d} | '
                 f'loss={mean_train_loss:.4f}  '
-                f'a={mean_train_dice["a"]:.3f}  '
-                f'v={mean_train_dice["v"]:.3f}  '
-                f'bv={mean_train_dice["bv"]:.3f}'
+                f'a={mean_dice_av["a"]:.3f}  '
+                f'v={mean_dice_av["v"]:.3f}  '
+                f'bv={mean_dice_bv:.3f}'
             )
 
         # ── End-of-epoch validation ──────────────────────────────────────────
         if val_ds is not None:
             model.eval()
-            val_loss  = 0.0
-            val_dice  = {'a': 0.0, 'v': 0.0, 'bv': 0.0}
-            val_steps = 0
+            val_loss     = 0.0
+            val_dice_bv  = 0.0
+            val_dice_av  = {'a': 0.0, 'v': 0.0}
+            val_steps    = 0
+            val_steps_av = 0
             with torch.no_grad():
                 for v_inp, v_gt, v_mask, v_bv_only in DataLoader(
                     val_ds, batch_size=1, worker_init_fn=worker_init_fn
@@ -860,21 +856,26 @@ def main() -> None:
                     v_preds     = model(v_inp_p)
                     val_loss   += criterion(v_preds, v_gt_p, v_mask_p, v_bv_only).item()
                     d_val       = dice_score(v_preds[-1], v_gt_p, v_mask_p)
-                    for k in ('a', 'v', 'bv'):
-                        val_dice[k] += d_val[k]
-                    val_steps += 1
-            n = max(val_steps, 1)
-            val_loss      /= n
-            mean_val_dice  = {k: val_dice[k] / n for k in ('a', 'v', 'bv')}
-            writer.add_scalar('Loss/val',    val_loss,            iteration)
-            writer.add_scalar('Dice/val/a',  mean_val_dice['a'],  iteration)
-            writer.add_scalar('Dice/val/v',  mean_val_dice['v'],  iteration)
-            writer.add_scalar('Dice/val/bv', mean_val_dice['bv'], iteration)
+                    val_dice_bv += d_val['bv']
+                    val_steps   += 1
+                    if v_bv_only.item() != 1.0:
+                        val_dice_av['a'] += d_val['a']
+                        val_dice_av['v'] += d_val['v']
+                        val_steps_av     += 1
+            n    = max(val_steps, 1)
+            n_av = max(val_steps_av, 1)
+            val_loss         /= n
+            mean_val_dice_bv  = val_dice_bv / n
+            mean_val_dice_av  = {k: val_dice_av[k] / n_av for k in ('a', 'v')}
+            writer.add_scalar('Loss/val',    val_loss,              iteration)
+            writer.add_scalar('Dice/val/a',  mean_val_dice_av['a'], iteration)
+            writer.add_scalar('Dice/val/v',  mean_val_dice_av['v'], iteration)
+            writer.add_scalar('Dice/val/bv', mean_val_dice_bv,      iteration)
             msg = (
                 f'  → val  loss={val_loss:.4f}  '
-                f'a={mean_val_dice["a"]:.3f}  '
-                f'v={mean_val_dice["v"]:.3f}  '
-                f'bv={mean_val_dice["bv"]:.3f}'
+                f'a={mean_val_dice_av["a"]:.3f}  '
+                f'v={mean_val_dice_av["v"]:.3f}  '
+                f'bv={mean_val_dice_bv:.3f}'
             )
             if val_loss < best_val_loss:
                 best_val_loss = val_loss
