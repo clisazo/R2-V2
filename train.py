@@ -447,12 +447,15 @@ class RRLoss(nn.Module):
 
     @staticmethod
     def _masked_bce(
-        logits:  torch.Tensor,
-        targets: torch.Tensor,
-        mask:    torch.Tensor,
+        logits:     torch.Tensor,
+        targets:    torch.Tensor,
+        mask:       torch.Tensor,
+        pos_weight: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         n    = mask.sum().clamp(min=1)
-        loss = F.binary_cross_entropy_with_logits(logits, targets, reduction='none')
+        loss = F.binary_cross_entropy_with_logits(
+            logits, targets, pos_weight=pos_weight, reduction='none'
+        )
         return (loss * mask).sum() / n
 
     def _base_loss(
@@ -474,8 +477,23 @@ class RRLoss(nn.Module):
         cr_m = y_a * y_v                                    # crossing pixels (A∩V)
         av_m = (y_a + y_v).clamp(0, 1) - cr_m              # non-crossing vessel pixels
 
+        # ── pos_weight for BV: balances ~14% vessel vs ~86% background ──────
+        # Without this, BCE gradient is dominated by background pixels and the
+        # model collapses to predicting everything as 0 (dice = 0 forever).
+        n_bv_pos = (y_bv * roi).sum().clamp(min=1)
+        n_bv_neg = roi.sum() - n_bv_pos
+        pw_bv    = (n_bv_neg / n_bv_pos).clamp(max=30)
+
+        # pos_weight for A and V within the vessel region
+        n_a_pos  = (y_a * bv_m).sum().clamp(min=1)
+        n_a_neg  = bv_m.sum() - n_a_pos
+        pw_a     = (n_a_neg / n_a_pos).clamp(max=30)
+        n_v_pos  = (y_v * bv_m).sum().clamp(min=1)
+        n_v_neg  = bv_m.sum() - n_v_pos
+        pw_v     = (n_v_neg / n_v_pos).clamp(max=30)
+
         # ── L_bv: vessel presence loss (always computed) ────────────────────
-        l_bv = self._masked_bce(pred_bv, y_bv, roi)
+        l_bv = self._masked_bce(pred_bv, y_bv, roi, pos_weight=pw_bv)
 
         # ── L_bg: background consistency (always computed) ──────────────────
         zeros = torch.zeros_like(pred_a)
@@ -487,8 +505,8 @@ class RRLoss(nn.Module):
         bv_flag = bv_only.view(-1, 1, 1, 1).to(pred.device)
 
         # L_av: A/V discrimination loss inside BV region
-        l_av = (self._masked_bce(pred_a, y_a, bv_m) +
-                self._masked_bce(pred_v, y_v, bv_m))
+        l_av = (self._masked_bce(pred_a, y_a, bv_m, pos_weight=pw_a) +
+                self._masked_bce(pred_v, y_v, bv_m, pos_weight=pw_v))
         l_av = l_av * (1.0 - bv_flag).squeeze()   # scalar; zero if bv_only
 
         # L_mx: mutual exclusion at non-crossing vessel pixels
@@ -833,6 +851,25 @@ def main() -> None:
                 f'v={mean_dice_av["v"]:.3f}  '
                 f'bv={mean_dice_bv:.3f}'
             )
+
+        # ── Logit probe (first 5 epochs, then every 10) ──────────────────────
+        if epoch <= 5 or epoch % 10 == 0:
+            model.eval()
+            with torch.no_grad():
+                probe_inp, probe_gt, probe_mask, probe_bv = next(iter(DataLoader(
+                    train_ds, batch_size=1, shuffle=False,
+                    worker_init_fn=worker_init_fn,
+                )))
+                probe_inp_p, _ = pad_batch(probe_inp.to(device))
+                probe_preds     = model(probe_inp_p)
+                lg = probe_preds[-1]
+                tqdm.write(
+                    f'  [logits epoch {epoch}]  '
+                    f'a: [{lg[:, 0].min():.3f}, {lg[:, 0].max():.3f}]  mean={lg[:, 0].mean():.3f}  '
+                    f'v: [{lg[:, 1].min():.3f}, {lg[:, 1].max():.3f}]  mean={lg[:, 1].mean():.3f}  '
+                    f'bv:[{lg[:, 2].min():.3f}, {lg[:, 2].max():.3f}]  mean={lg[:, 2].mean():.3f}'
+                )
+            model.train()
 
         # ── End-of-epoch validation ──────────────────────────────────────────
         if val_ds is not None:
