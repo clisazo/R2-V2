@@ -784,6 +784,12 @@ def main() -> None:
                         f'gt_bv_sum={gt_p[:, 2].sum():.0f}  '
                         f'mask_sum={mask_p.sum():.0f}'
                     )
+                    for ci, cn in enumerate(['a', 'v', 'bv']):
+                        tqdm.write(
+                            f'  [{cn}]  '
+                            f'frac_pos={(probs[:, ci] > 0.5).float().mean():.4f}  '
+                            f'gt_sum={gt_p[:, ci].sum():.0f}'
+                        )
 
             running_loss   += loss.item()
             epoch_loss_sum += loss.item()
